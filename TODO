@@ -1,0 +1,2 @@
+the tb_boot_from_flash_model.v works, However J26H1 does not - Its a good idea would be to start debugging from,
+1. Why the spislave is not sending byte transfer interrupts

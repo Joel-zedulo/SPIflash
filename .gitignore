@@ -1,0 +1,8 @@
+*.fst
+*.vcd
+*.cnf*
+*.rpt
+*.bak
+*.swp
+*.save
+output/

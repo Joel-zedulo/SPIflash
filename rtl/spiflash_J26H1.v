@@ -1,0 +1,356 @@
+         /////////////////////////////////////////////////////////////////////
+        //   //   //   //   //                       //   //   //   //
+       //   //   //   //   //  REDONE  SPI  FLASH   //   //   //   //
+      //   //   //   //   //                       //   //   //   //
+///////////////////////////////////////////////////////////////////
+// EDIT: created a MEM_SIZE parameter;
+//       Reduced the MEM_SIZE from 16MB to 4KB so that Quartus kindly stopped crashing my PC during synthesis. ;)
+
+module spiflash_J26H1 #(
+	parameter MEM_SIZE = 4 * 1024,
+	parameter CLK_FREQ  = 20_000_000,
+	parameter BAUD_RATE = 19_200
+)(
+// Xtra-fast clock used in debouncing signals.
+	input sys_clk,
+	input rst_n,
+
+// Uart interface for loading firmware
+	input uart_rx,
+	output memset_o,
+
+// Reset values for data transfer & timing.
+	input [2:0] dflt_xfer_mode_i,
+	input [1:0] dflt_timing_mode_i,
+
+// SPI Communication Lines
+	input csb,
+	input clk,
+
+	input io0_i, // MOSI
+	input io1_i,
+	input io2_i,
+	input io3_i,
+
+	output io0_o,
+	output io1_o, // MISO
+	output io2_o,
+	output io3_o
+);
+	localparam std_xfer     = 1;
+	localparam dual_xfer_rd = 2;
+	localparam dual_xfer_wr = 3;
+	localparam quad_xfer_rd = 4;
+	localparam quad_xfer_wr = 5;
+
+	localparam single = 1;
+	localparam dual   = 2;
+	localparam quad   = 4;
+	localparam octal  = 8;
+
+	reg [7:0] memory [0: MEM_SIZE-1];
+
+	reg memset;
+	wire uart_frame_alert, uart_frame_valid;
+	wire uart_start_bit, uart_stop_bit;
+	wire [9:0] uart_8N1_frame;
+	wire [7:0] uart_byte;
+	integer uart_byte_count;
+
+	wire [3:0] bitrate, latency;
+
+	reg  [7:0] outbound_byte;
+	wire [7:0] inbound_byte;
+	wire byte_received;
+	wire byte_sent;
+
+	reg [2:0] xfer_mode;
+	reg [1:0] timing_mode;
+
+	reg [3:0] reset_count;
+	reg [3:0] reset_monitor;
+	integer bytecount;
+	integer dummycount;
+
+	reg [7:0] spi_cmd;
+	reg [7:0] xip_cmd;
+	reg [23:0] spi_addr;
+
+	reg [7:0] spi_in;
+	reg [7:0] spi_out;
+	reg spi_io_vld;
+
+	wire [3:0] oe;
+
+	assign oe = (xfer_mode == std_xfer) ? 4'b0010 :
+			(xfer_mode == dual_xfer_rd) ? 4'b0000 :
+			(xfer_mode == dual_xfer_wr) ? 4'b0011 :
+			(xfer_mode == quad_xfer_rd) ? 4'b0000 :
+			(xfer_mode == quad_xfer_wr) ? 4'b1111 : 4'bz;
+
+	reg powered_up = 1; // VexRISC core does not properly reset the SPI flash
+
+	assign bitrate = (xfer_mode == std_xfer) ? single :
+			( (xfer_mode == dual_xfer_rd) || (xfer_mode == dual_xfer_wr) ) ? dual :
+			( (xfer_mode == quad_xfer_rd) || (xfer_mode == quad_xfer_wr) ) ? quad : single;
+
+	assign latency = (bitrate == single) ? octal :
+			(bitrate == dual) ? quad :
+			(bitrate == quad) ? dual :
+			(bitrate == octal) ? single : octal;
+
+	assign memset_o = memset;
+	assign {uart_stop_bit, uart_byte, uart_start_bit} = uart_8N1_frame;
+	assign uart_frame_valid = !uart_start_bit && uart_stop_bit; // low start, high stop bits;
+
+// this slave fully support standard SPI transfers for now,
+// We place any desired changes to transfer mode into the `xfer_mode` register,
+// later i'll upgrade the SLAVE to support transfer_mode control.
+	spi_slave spi_slave (
+		.sys_clk         (sys_clk),       // Xtra fast clock for bit preloading in mode 0
+		.timing_mode_i   (timing_mode),   // SPI CPOL-CPHA timing mode selection
+		.xfer_mode_i     (xfer_mode),     // STD:1 / Dual-rd:2 / Dual-wr:3 / Quad-rd:4 / Quad-wr:5
+		.bit_order_lsb_i (1'b0),          // For typical MSB-first data transfer, use 0
+		.byte_i          (outbound_byte), // to caravel
+		.byte_o          (inbound_byte),  // from caravel
+//		.dqs_i           (oe),            // HIGH while SoC reads from our spi slave
+
+		.byte_sent       (byte_sent),	  // outbound complete (Interrupt)
+		.byte_received   (byte_received), // inbound  complete (Interrupt)
+
+		.sck             (clk),           // SPI clock from master (caravel)
+		.cs_n            (csb),           // Active-low chip select
+		.io0_i           (io0_i),         // MOSI
+		.io1_i           (io1_i),
+		.io2_i           (io2_i),
+		.io3_i           (io3_i),
+		.io0_o           (io0_o),
+		.io1_o           (io1_o),         // MISO
+		.io2_o           (io2_o),
+		.io3_o           (io3_o)
+	);
+
+	// this is a simple UART 8N1 reciever for loading the flash;
+	deserializer #(
+		.CLK_FREQ    (CLK_FREQ),
+		.BAUD_RATE   (BAUD_RATE)
+	) uart_flash_loader (
+		.binary_data (uart_8N1_frame),
+		.done        (uart_frame_alert),
+		.clock       (sys_clk),
+		.serial_data (uart_rx)
+	);
+
+
+// MEMORY INIT
+	always @(posedge sys_clk or negedge rst_n) begin
+		if (!rst_n) begin
+			memset          <= 0;
+			uart_byte_count <= 0;
+		end else if (uart_frame_alert) begin
+			if (!memset) begin
+				if (uart_frame_valid && uart_byte_count < MEM_SIZE-1) begin
+					memory[uart_byte_count] <= uart_byte;
+					uart_byte_count         <= uart_byte_count + 1;
+				end else begin
+					memset <= 1'b1;
+				end
+			end
+		end
+	end
+
+// XIP RESET MONITORING
+	always @(posedge clk or posedge csb) begin
+		if (csb) begin
+			reset_count   <= 4'b0;
+			reset_monitor <= 4'b0;
+		end else begin
+			if (reset_count < 4'h9) begin
+				reset_count <= reset_count + 1;
+
+				if (io0_i) begin
+					reset_monitor <= reset_monitor + 1;
+				end
+			end
+		end
+	end
+
+// SLAVE DATA IO
+	reg csb_negedge_handled = 0;
+
+	always @(posedge sys_clk or posedge csb) begin
+		if (csb) begin
+			outbound_byte       <= 8'b0;
+			xfer_mode           <= (rst_n) ? dflt_xfer_mode_i : xfer_mode;
+			timing_mode         <= dflt_timing_mode_i;
+			bytecount           <= 0;
+			csb_negedge_handled <= 0;
+
+			// Handle MBR.  If in XIP continuous mode, the following
+			// 8 clock cycles are normally not expected to be a command.
+			// If followed by CSB high, however, if the address bits
+			// are consistent with io0 == 1 for 8 clk cycles, then an
+			// MBR has been issued and the system must exit XIP
+			// continuous mode.
+			if (xip_cmd == 8'hbb || xip_cmd == 8'heb
+			   || xip_cmd == 8'hed) begin
+				if (reset_count == 4'h8 && reset_monitor == 4'h8) begin
+					xip_cmd <= 8'h00;
+					spi_cmd <= 8'h03;
+				end
+			end
+
+			xip_cmd <= 0;
+
+		end else if (!csb_negedge_handled) begin
+			if (xip_cmd) outbound_byte <= xip_cmd; // this line needed to be cs_n edge sensitive
+
+
+			csb_negedge_handled <= 1;
+
+		end else begin
+
+			if (byte_received) begin
+
+				bytecount <= bytecount +1;
+
+				if (dummycount > 0) begin
+					dummycount <= dummycount - 1;
+					outbound_byte <= 8'b0;
+				end else begin
+					if (bytecount == 0) begin
+						spi_cmd <= inbound_byte;
+						outbound_byte <= inbound_byte;
+
+						case (inbound_byte)
+						8'hab: powered_up <= 1;
+
+						8'hb9: powered_up <= 0;
+
+						8'hff: xip_cmd <= 1;
+
+						default: ;
+						endcase
+					end
+
+					if (powered_up) begin
+						case (spi_cmd)
+						8'h03: begin
+							case (bytecount)
+							0: xfer_mode <= std_xfer;
+
+							1: begin
+								spi_addr[23:16] <= inbound_byte;
+								outbound_byte <= 8'b0;
+							end
+
+							2: spi_addr[15:8] <= inbound_byte;
+
+							3: begin
+								outbound_byte <= memory[{spi_addr[23:8], inbound_byte}];
+								spi_addr <= {spi_addr[23:8], inbound_byte} +1;
+							end
+
+							default: begin
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+							endcase
+						end
+
+						8'hbb: begin
+							case (bytecount)
+							0: xfer_mode <= dual_xfer_rd;
+
+							1: spi_addr[23:16] <= inbound_byte;
+
+							2: spi_addr[15:8] <= inbound_byte;
+
+							3: begin
+								spi_addr[7:0] <= inbound_byte;
+								xfer_mode <= dual_xfer_wr;
+							end
+
+							4: begin
+								xip_cmd <= (inbound_byte == 8'ha5) ? spi_cmd : 8'b0;
+								outbound_byte <= 8'b0;
+								dummycount <= latency;
+
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+
+							default: begin
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+							endcase
+						end
+
+						8'heb: begin
+							case (bytecount)
+							0: xfer_mode <= quad_xfer_rd;
+
+							1: spi_addr[23:16] <= inbound_byte;
+
+							2: spi_addr[15:8] <= inbound_byte;
+
+							3: begin
+								spi_addr[7:0] <= inbound_byte;
+								xfer_mode <= quad_xfer_wr;
+							end
+
+							4: begin
+								xip_cmd <= (inbound_byte == 8'ha5) ? spi_cmd : 8'b0;
+								outbound_byte <= 8'b0;
+								dummycount <= latency;
+
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+
+							default: begin
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+							endcase
+						end
+
+						8'hed: begin
+							case (bytecount)
+							0: xfer_mode <= dual_xfer_rd;
+
+							1: spi_addr[23:16] <= inbound_byte;
+
+							2: spi_addr[15:8] <= inbound_byte;
+
+							3: begin
+								spi_addr[7:0] <= inbound_byte;
+								xfer_mode <= dual_xfer_wr;
+							end
+
+							4: begin
+								xip_cmd <= (inbound_byte == 8'ha5) ? spi_cmd : 8'b0;
+								outbound_byte <= 8'b0;
+								dummycount <= latency;
+
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+
+							default: begin
+								outbound_byte <= memory[spi_addr];
+								spi_addr <= spi_addr +1;
+							end
+							endcase
+						end
+
+						default: ;
+						endcase
+					end
+				end
+			end
+		end
+	end
+
+endmodule
